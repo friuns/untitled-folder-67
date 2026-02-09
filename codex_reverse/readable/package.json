@@ -8,6 +8,8 @@
     "compile": "tsc -b",
     "tsc": "tsc -noEmit",
     "dev": "pnpm --dir .. run generate:third-party-notices && NODE_ENV=development electron-forge start",
+    "webui": "NODE_ENV=production electron . --webui",
+    "webui:remote": "NODE_ENV=production electron . --webui --remote",
     "build": "rm -rf out && PNPM_YES=true pnpm run forge:make -- --platform=darwin --arch=arm64",
     "forge:package": "pnpm run rebuild:forge-natives && electron-forge package",
     "forge:make": "pnpm run rebuild:forge-natives && electron-forge make",

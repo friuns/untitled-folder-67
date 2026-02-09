@@ -52983,11 +52983,18 @@ function nre() {
           return (
             (gl[t] = e),
             function (...n) {
-              (Pb("console", {
+              Pb("console", {
                 args: n,
                 level: t,
-              }),
-                gl[t]?.apply(st.console, n));
+              });
+              try {
+                gl[t]?.apply(st.console, n);
+              } catch (r) {
+                const i = r?.code;
+                if (i === "EIO" || i === "EPIPE" || i === "ERR_STREAM_DESTROYED")
+                  return;
+                throw r;
+              }
             }
           );
         });
@@ -86843,6 +86850,67 @@ const fk = Rce({
     errorReporter: ti,
   }),
   Ji = (t) => Vt.isTrustedIpcSender(t.sender, t.senderFrame ?? null);
+function webUiParsePortArg(t, e) {
+  const n = Number.parseInt(String(t ?? ""), 10);
+  return Number.isFinite(n) && n >= 1 && n <= 65535 ? n : e;
+}
+function webUiParseCliOptions(t = process.argv, e = process.env) {
+  let n = !1,
+    r = !1,
+    i = webUiParsePortArg(e.CODEX_WEBUI_PORT, 3210),
+    a = (e.CODEX_WEBUI_TOKEN ?? "").trim(),
+    o = (e.CODEX_WEBUI_ORIGINS ?? "")
+      .split(",")
+      .map((u) => u.trim())
+      .filter(Boolean);
+  for (let s = 0; s < t.length; s++) {
+    const c = t[s];
+    if (c === "--webui") {
+      n = !0;
+      continue;
+    }
+    if (c === "--remote") {
+      r = !0;
+      continue;
+    }
+    if (c === "--port" && s + 1 < t.length) {
+      i = webUiParsePortArg(t[s + 1], i);
+      s += 1;
+      continue;
+    }
+    if (c.startsWith("--port=")) {
+      i = webUiParsePortArg(c.slice("--port=".length), i);
+      continue;
+    }
+    if (c === "--token" && s + 1 < t.length) {
+      a = String(t[s + 1] ?? "").trim();
+      s += 1;
+      continue;
+    }
+    if (c.startsWith("--token=")) {
+      a = c.slice("--token=".length).trim();
+      continue;
+    }
+    if (c.startsWith("--origins=")) {
+      o = c
+        .slice("--origins=".length)
+        .split(",")
+        .map((u) => u.trim())
+        .filter(Boolean);
+      continue;
+    }
+  }
+  return {
+    enabled: n,
+    remote: r,
+    port: i,
+    token: a,
+    origins: o,
+  };
+}
+const webUiOptions = webUiParseCliOptions();
+let webUiRuntime = null,
+  webUiBridgeWindow = null;
 let Nl = !1,
   Cs = null;
 function gde() {
@@ -86886,6 +86954,7 @@ electron.app.setAboutPanelOptions({
 });
 i3 && electron.app.quit();
 electron.app.on("window-all-closed", () => {
+  if (webUiOptions.enabled) return;
   process.platform !== "darwin" && electron.app.quit();
 });
 electron.app.on("before-quit", (t) => {
@@ -87091,6 +87160,380 @@ const Ade = async (t, e) => {
     );
   },
   Dde = YB(Ml);
+function webUiTokensEqual(t, e) {
+  if (!t || !e) return !1;
+  try {
+    const n = Buffer.from(t),
+      r = Buffer.from(e);
+    return n.length === r.length && require("node:crypto").timingSafeEqual(n, r);
+  } catch {
+    return !1;
+  }
+}
+function webUiParseCookieHeader(t) {
+  if (!t) return {};
+  return t
+    .split(";")
+    .map((r) => r.trim())
+    .filter(Boolean)
+    .reduce((r, i) => {
+      const a = i.indexOf("=");
+      if (a <= 0) return r;
+      const o = i.slice(0, a).trim(),
+        s = i.slice(a + 1).trim();
+      try {
+        r[o] = decodeURIComponent(s);
+      } catch {
+        r[o] = s;
+      }
+      return r;
+    }, {});
+}
+function webUiExtractAuthToken(t, e) {
+  const n = t.headers.authorization;
+  if (typeof n == "string" && n.startsWith("Bearer ")) return n.slice(7).trim();
+  const r = t.headers["x-codex-webui-token"];
+  if (typeof r == "string" && r.trim()) return r.trim();
+  const i = e.searchParams.get("token");
+  if (i && i.trim()) return i.trim();
+  const a = webUiParseCookieHeader(t.headers.cookie ?? "").codex_webui_token;
+  return typeof a == "string" ? a.trim() : "";
+}
+function webUiResolveAssetPath(t, e) {
+  let n;
+  try {
+    n = decodeURIComponent(e);
+  } catch {
+    return null;
+  }
+  const r = n === "/" ? "index.html" : n.replace(/^[/\\]+/, ""),
+    i = path2.resolve(t),
+    a = path2.resolve(i, r);
+  return a === i || a.startsWith(`${i}${path2.sep}`) ? a : null;
+}
+function webUiSetResponseSecurityHeaders(t) {
+  (t.setHeader("X-Content-Type-Options", "nosniff"),
+    t.setHeader("X-Frame-Options", "DENY"),
+    t.setHeader("Referrer-Policy", "no-referrer"),
+    t.setHeader("Cross-Origin-Resource-Policy", "same-origin"),
+    t.setHeader(
+      "Content-Security-Policy",
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    ));
+}
+function webUiInjectRuntimeScripts(t) {
+  if (t.includes("/webui-bridge.js")) return t;
+  const e = `
+    <script src="/webui-config.js"></script>
+    <script src="/webui-bridge.js"></script>
+`;
+  return t.includes("</head>") ? t.replace("</head>", `${e}</head>`) : `${e}${t}`;
+}
+async function webUiCreateBridgeWindow() {
+  const t = new electron.BrowserWindow({
+    width: 1,
+    height: 1,
+    show: !1,
+    title: "Codex WebUI Bridge",
+    webPreferences: {
+      preload: _de,
+      contextIsolation: !0,
+      nodeIntegration: !1,
+      spellcheck: !1,
+      devTools: !1,
+    },
+  });
+  t.setMenuBarVisibility(!1);
+  const e = () => {
+    webUiOptions.enabled && !Vt.isAppQuitting && t.hide();
+  };
+  (t.on("close", (n) => {
+    webUiOptions.enabled &&
+      !Vt.isAppQuitting &&
+      (n.preventDefault(),
+      t.isVisible() && t.hide(),
+      setImmediate(() => {
+        t.isDestroyed() || t.hide();
+      }));
+  }),
+    t.on("minimize", e),
+    Vt.registerWindow(t, Pt, !0),
+    Vt.getContext(Pt)?.registerWindow(t),
+    await t.loadURL("about:blank"));
+  return t;
+}
+async function webUiInvokeElectronBridgeMethod(t, e, n) {
+  if (t.isDestroyed() || t.webContents.isDestroyed())
+    throw new Error("WebUI bridge window is not available.");
+  const r = JSON.stringify(e),
+    i = JSON.stringify(n ?? []),
+    a = `
+    Promise.resolve().then(async () => {
+      const bridge = window.electronBridge;
+      if (!bridge || typeof bridge[${r}] !== "function") {
+        return null;
+      }
+      return await bridge[${r}](...${i});
+    });
+  `;
+  return t.webContents.executeJavaScript(a, !0);
+}
+async function webUiStartBridgeRuntime({ bridgeWindow: t, context: e }) {
+  const n = require("node:http"),
+    r = require("mime-types"),
+    { WebSocketServer: i, WebSocket: a } = require("ws"),
+    o = path2.join(kl, "webview"),
+    s = webUiOptions.remote ? "0.0.0.0" : "127.0.0.1",
+    c = webUiOptions.remote || !!webUiOptions.token,
+    u =
+      c && !webUiOptions.token
+        ? require("node:crypto").randomBytes(24).toString("hex")
+        : webUiOptions.token,
+    l = new Set(webUiOptions.origins),
+    p = new Set();
+  let d = "";
+  const f = (B, j) => {
+      if (typeof B != "string") return !1;
+      if (l.size > 0) return l.has(B);
+      try {
+        return B.length === 0 ? !0 : new URL(B).host === j;
+      } catch {
+        return !1;
+      }
+    },
+    m = (B) => {
+      if (p.size === 0) return;
+      let j;
+      try {
+        j = JSON.stringify(B);
+      } catch {
+        return;
+      }
+      for (const X of p)
+        X.readyState === a.OPEN &&
+          X.send(j, (V) => {
+            V &&
+              Xt().warning("WebUI socket send failed", {
+                message: we(V),
+              });
+          });
+    },
+    h = t.webContents.send.bind(t.webContents);
+  t.webContents.send = (B, ...j) => {
+    (B === bt
+      ? m({
+          kind: "message-for-view",
+          payload: j[0],
+        })
+      : B.startsWith("codex_desktop:worker:") &&
+        B.endsWith(":for-view") &&
+        m({
+          kind: "worker-message-for-view",
+          workerId: B.slice("codex_desktop:worker:".length, -":for-view".length),
+          payload: j[0],
+        }),
+      h(B, ...j));
+  };
+  const v = n.createServer(async (B, j) => {
+      const X = new URL(B.url ?? "/", `http://${B.headers.host ?? "127.0.0.1"}`);
+      if ((webUiSetResponseSecurityHeaders(j), c)) {
+        const Z = webUiExtractAuthToken(B, X);
+        if (!webUiTokensEqual(Z, u)) {
+          ((j.statusCode = 401),
+            j.setHeader("Content-Type", "text/plain; charset=utf-8"),
+            j.end("Unauthorized"));
+          return;
+        }
+        X.searchParams.get("token") &&
+          j.setHeader(
+            "Set-Cookie",
+            `codex_webui_token=${encodeURIComponent(u)}; Path=/; HttpOnly; SameSite=Lax`,
+          );
+      }
+      if (X.pathname === "/webui-config.js") {
+        const Z = JSON.stringify({
+          wsPath: "/ws",
+          buildFlavor: sn,
+          sentryInitOptions: ma,
+          appSessionId: Ya,
+        });
+        (j.setHeader("Content-Type", "application/javascript; charset=utf-8"),
+          j.setHeader("Cache-Control", "no-store"),
+          j.end(`window.__CODEX_WEBUI_CONFIG__=${Z};`));
+        return;
+      }
+      let V = webUiResolveAssetPath(o, X.pathname);
+      if (
+        (X.pathname === "/" || X.pathname === "/index.html") &&
+        (V = path2.join(o, "index.html")),
+        V)
+        try {
+          const Z = await fs3.promises.stat(V);
+          if (Z.isFile()) {
+            if (path2.basename(V) === "index.html") {
+              d || (d = webUiInjectRuntimeScripts(await fs3.promises.readFile(V, "utf8")));
+              (j.setHeader("Content-Type", "text/html; charset=utf-8"),
+                j.setHeader("Cache-Control", "no-store"),
+                j.end(d));
+              return;
+            }
+            const tt = r.lookup(V);
+            (j.setHeader(
+              "Content-Type",
+              typeof tt == "string"
+                ? tt.includes("charset")
+                  ? tt
+                  : `${tt}; charset=utf-8`
+                : "application/octet-stream",
+            ),
+              j.setHeader("Cache-Control", "no-store"),
+              fs3.createReadStream(V)
+                .on("error", (et) => {
+                  (Xt().warning("WebUI static stream failed", {
+                    message: we(et),
+                  }),
+                    j.headersSent ||
+                      (j.statusCode = 500,
+                      j.setHeader("Content-Type", "text/plain; charset=utf-8")),
+                    j.end("Internal Server Error"));
+                })
+                .pipe(j));
+            return;
+          }
+        } catch {}
+      if (
+        X.pathname === "/api" ||
+        X.pathname.startsWith("/api/") ||
+        X.pathname === "/auth" ||
+        X.pathname.startsWith("/auth/") ||
+        X.pathname === "/ws"
+      ) {
+        ((j.statusCode = 404),
+          j.setHeader("Content-Type", "text/plain; charset=utf-8"),
+          j.end("Not Found"));
+        return;
+      }
+      const ee = path2.join(o, "index.html");
+      try {
+        d || (d = webUiInjectRuntimeScripts(await fs3.promises.readFile(ee, "utf8")));
+      } catch {
+        d = "<!doctype html><html><body><h1>Web UI unavailable</h1></body></html>";
+      }
+      (j.setHeader("Content-Type", "text/html; charset=utf-8"),
+        j.setHeader("Cache-Control", "no-store"),
+        j.end(d));
+    }),
+    g = new i({
+      noServer: !0,
+      perMessageDeflate: !1,
+    });
+  v.on("upgrade", (B, j, X) => {
+    const V = new URL(B.url ?? "/", `http://${B.headers.host ?? "127.0.0.1"}`);
+    if (V.pathname !== "/ws") {
+      (j.write("HTTP/1.1 404 Not Found\r\n\r\n"), j.destroy());
+      return;
+    }
+    if (!f(B.headers.origin ?? "", B.headers.host ?? "")) {
+      (j.write("HTTP/1.1 403 Forbidden\r\n\r\n"), j.destroy());
+      return;
+    }
+    if (c && !webUiTokensEqual(webUiExtractAuthToken(B, V), u)) {
+      (j.write("HTTP/1.1 401 Unauthorized\r\n\r\n"), j.destroy());
+      return;
+    }
+    g.handleUpgrade(B, j, X, (Z) => {
+      g.emit("connection", Z, B);
+    });
+  });
+  g.on("connection", (B) => {
+    (p.add(B),
+      B.on("close", () => {
+        p.delete(B);
+      }));
+    let j = Date.now(),
+      X = 0;
+    B.on("message", async (V) => {
+      const Z = Date.now();
+      if (Z - j > 6e4) {
+        ((j = Z), (X = 0));
+      }
+      if (((X += 1), X > 240)) {
+        B.close(1008, "Rate limit exceeded");
+        return;
+      }
+      let tt;
+      try {
+        tt = JSON.parse(String(V));
+      } catch {
+        B.send(
+          JSON.stringify({
+            kind: "bridge-error",
+            message: "Invalid payload",
+          }),
+        );
+        return;
+      }
+      try {
+        if (tt?.kind === "message-from-view") {
+          const et = tt.payload;
+          if (!et || typeof et.type != "string") return;
+          await e.handleMessage(t.webContents, et);
+          return;
+        }
+        if (tt?.kind === "worker-message-from-view") {
+          if (typeof tt.workerId != "string" || tt.workerId.length === 0) return;
+          await webUiInvokeElectronBridgeMethod(t, "sendWorkerMessageFromView", [tt.workerId, tt.payload]);
+          return;
+        }
+        if (tt?.kind === "trigger-sentry-test") {
+          await webUiInvokeElectronBridgeMethod(t, "triggerSentryTestError", []);
+          return;
+        }
+      } catch (et) {
+        Xt().warning("WebUI bridge dispatch failed", {
+          message: we(et),
+        });
+        B.send(
+          JSON.stringify({
+            kind: "bridge-error",
+            message: "Bridge dispatch failed",
+          }),
+        );
+      }
+    });
+  });
+  await new Promise((B, j) => {
+    v.once("error", j);
+    v.listen(webUiOptions.port, s, () => {
+      const X = v.address();
+      typeof X == "object" && X && "port" in X && (webUiOptions.port = X.port);
+      (v.off("error", j), B(void 0));
+    });
+  });
+  Xt().info("WebUI bridge started", {
+    host: s,
+    port: webUiOptions.port,
+    remote: webUiOptions.remote,
+    authRequired: c,
+    originAllowlist: [...l],
+  });
+  c &&
+    Xt().info("WebUI access token", {
+      token: u,
+    });
+  return {
+    host: s,
+    port: webUiOptions.port,
+    token: c ? u : "",
+    dispose: async () => {
+      (g.close(),
+        await new Promise((B) => {
+          v.close(() => B(void 0));
+        }),
+        (t.webContents.send = h));
+    },
+  };
+}
 or.add(
   u7({
     appServerConnection: Dde.appServerConnection,
@@ -87106,6 +87549,10 @@ const Rde = (t) => {
     for (const e of t) jp.set(e.id, e);
   },
   kc = async (t) => {
+    if (webUiOptions.enabled && t === Pt) {
+      const n = webUiBridgeWindow;
+      if (n && !n.isDestroyed()) return n;
+    }
     const e = Vt.getPrimaryWindow(t);
     if (e)
       return (
@@ -87181,10 +87628,17 @@ electron.app.whenReady().then(async () => {
           Xt().warning(`Failed to install React DevTools (${we(t)})`);
         }),
     await Bp.refresh(),
-    await kc(Pt),
+    webUiOptions.enabled
+      ? ((webUiBridgeWindow = await webUiCreateBridgeWindow()),
+        (webUiRuntime = await webUiStartBridgeRuntime({
+          bridgeWindow: webUiBridgeWindow,
+          context: Dde,
+        })))
+      : await kc(Pt),
     await fk.flushPendingDeepLinks());
 });
 electron.app.on("activate", () => {
+  if (webUiOptions.enabled) return;
   (Vt.showPrimaryWindow(Pt) || kc(Pt), Bp.refresh());
 });
 electron.app.on("browser-window-blur", () => {
@@ -87197,6 +87651,8 @@ electron.app.on("browser-window-focus", () => {
     }));
 });
 async function ZB() {
+  if (webUiOptions.enabled && webUiBridgeWindow && !webUiBridgeWindow.isDestroyed())
+    return webUiBridgeWindow;
   return kc(Pt);
 }
 function KB(t, e) {
@@ -87239,6 +87695,13 @@ electron.ipcMain.handle(_7, (t) => {
   });
 });
 electron.app.on("will-quit", () => {
+  webUiRuntime &&
+    (webUiRuntime.dispose().catch((t) => {
+      Xt().warning("WebUI shutdown failed", {
+        message: we(t),
+      });
+    }),
+    (webUiRuntime = null));
   for (const t of Pl.values()) t.flush();
   for (const t of n_.values()) t.flushTelemetry();
   or.dispose();
