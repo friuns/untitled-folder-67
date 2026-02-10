@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_PATH="/Applications/Codex.app"
 APP_ASAR="$APP_PATH/Contents/Resources/app.asar"
 CLI_PATH="$APP_PATH/Contents/Resources/codex"
 PATCH_BASE="/Users/igor/temp/untitled folder 67/codex_reverse/readable"
-DEPS_DIR="${CODEX_WEBUI_PATCH_DEPS:-$HOME/.cache/codex-webui-patch-deps}"
+VENDOR_DIR="${CODEX_WEBUI_VENDOR_DIR:-$SCRIPT_DIR/webui_vendor/node_modules}"
 PORT="${CODEX_WEBUI_PORT:-4310}"
 REMOTE=0
 KEEP_TEMP=0
@@ -20,7 +21,7 @@ Usage:
 Options:
   --app <path>           Codex.app path
   --patch-base <path>    patched readable source path
-  --deps-dir <path>      cache dir for ws/mime-types deps
+  --vendor-dir <path>    vendor node_modules dir (ws, mime-types, mime-db)
   --port <n>             webui port (default: 4310)
   --remote               pass --remote
   --user-data-dir <path> chromium user data dir override
@@ -37,8 +38,8 @@ while (($#)); do
       APP_PATH="${2:?missing value}"; APP_ASAR="$APP_PATH/Contents/Resources/app.asar"; CLI_PATH="$APP_PATH/Contents/Resources/codex"; shift 2 ;;
     --patch-base)
       PATCH_BASE="${2:?missing value}"; shift 2 ;;
-    --deps-dir)
-      DEPS_DIR="${2:?missing value}"; shift 2 ;;
+    --vendor-dir)
+      VENDOR_DIR="${2:?missing value}"; shift 2 ;;
     --port)
       PORT="${2:?missing value}"; shift 2 ;;
     --remote)
@@ -63,14 +64,9 @@ done
 [[ -f "$PATCH_BASE/.vite/build/main.js" ]] || { echo "Missing patch main.js in $PATCH_BASE" >&2; exit 1; }
 [[ -f "$PATCH_BASE/webview/index.html" ]] || { echo "Missing patch webview/index.html in $PATCH_BASE" >&2; exit 1; }
 [[ -f "$PATCH_BASE/webview/webui-bridge.js" ]] || { echo "Missing patch webview/webui-bridge.js in $PATCH_BASE" >&2; exit 1; }
-
-if [[ ! -d "$DEPS_DIR/node_modules/ws" || ! -d "$DEPS_DIR/node_modules/mime-types" || ! -d "$DEPS_DIR/node_modules/mime-db" ]]; then
-  mkdir -p "$DEPS_DIR"
-  [[ -f "$DEPS_DIR/package.json" ]] || cat > "$DEPS_DIR/package.json" <<'PKG'
-{"name":"codex-webui-patch-deps","private":true}
-PKG
-  npm --prefix "$DEPS_DIR" install --no-audit --no-fund ws mime-types >/dev/null
-fi
+[[ -d "$VENDOR_DIR/ws" ]] || { echo "Missing vendor module: $VENDOR_DIR/ws" >&2; exit 1; }
+[[ -d "$VENDOR_DIR/mime-types" ]] || { echo "Missing vendor module: $VENDOR_DIR/mime-types" >&2; exit 1; }
+[[ -d "$VENDOR_DIR/mime-db" ]] || { echo "Missing vendor module: $VENDOR_DIR/mime-db" >&2; exit 1; }
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-webui-unpacked.XXXXXX")"
 APP_DIR="$WORKDIR/app"
@@ -104,9 +100,9 @@ cp "$PATCH_BASE/.vite/build/$source_main_js_rel" "$APP_DIR/.vite/build/$target_m
 cp "$PATCH_BASE/webview/assets/$source_renderer_js_rel" "$APP_DIR/webview/assets/$target_renderer_js_rel"
 cp "$PATCH_BASE/webview/webui-bridge.js" "$APP_DIR/webview/webui-bridge.js"
 mkdir -p "$APP_DIR/node_modules"
-cp -R "$DEPS_DIR/node_modules/ws" "$APP_DIR/node_modules/ws"
-cp -R "$DEPS_DIR/node_modules/mime-types" "$APP_DIR/node_modules/mime-types"
-cp -R "$DEPS_DIR/node_modules/mime-db" "$APP_DIR/node_modules/mime-db"
+cp -R "$VENDOR_DIR/ws" "$APP_DIR/node_modules/ws"
+cp -R "$VENDOR_DIR/mime-types" "$APP_DIR/node_modules/mime-types"
+cp -R "$VENDOR_DIR/mime-db" "$APP_DIR/node_modules/mime-db"
 
 rg -q -- '--webui' "$APP_DIR/.vite/build/$target_main_js_rel" || { echo "Patched main missing --webui" >&2; exit 1; }
 
